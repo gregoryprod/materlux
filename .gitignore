@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.key
+*.pem
+*credentials*
+*webhook*.json
+transcription-models/
+transcription-deps/
+node_modules/
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.flac
+*.aac
+*.xlsx
+*.b64
+Журнал выгрузки*
+Сотрудники_источник.json

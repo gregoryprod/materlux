@@ -1,0 +1,4 @@
+interface:
+  display_name: "ОКК Materlux"
+  short_description: "Звонки, транскрибации и оценка качества Materlux"
+  default_prompt: "Используй $materlux-call-quality для полного цикла ОКК за вчера по Москве."
