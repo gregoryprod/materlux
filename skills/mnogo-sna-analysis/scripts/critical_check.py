@@ -278,7 +278,7 @@ def check_dashboard(m):
     return data,text,{'item_rows':len(items),'missing_metric_rows':len(missing),'other_product_rows':len(others),**sums(items),'addresses_matched':sum(x['region']!='Требует уточнения' for x in actual)}
 
 
-def check_tariffs(m,data):
+def check_tariffs_legacy(m,data):
     p=data['shipping'];approved=m['shipping_parameters']
     for key,value in approved.items():require(p[key]==value,'Неверный параметр ПЭК: '+key)
     dims=[D(str(x)) for x in p['dimensions_m']]
@@ -310,15 +310,85 @@ def check_tariffs(m,data):
     return {'cities':len(cities),'eligible_qty':float(qty),'estimate':float(costs),'provider_live_rechecked':False}
 
 
+def check_tariffs(m,data):
+    p=data['shipping'];approved=m['shipping_parameters']
+    if 'profiles' not in approved:
+        require('profiles' not in p,'Манифест не описывает два профиля ПЭК')
+        return check_tariffs_legacy(m,data)
+    for key,value in approved.items():require(p.get(key)==value,'Неверный параметр ПЭК: '+key)
+    require(p['destination_mode']=='Доставить по адресу','Получение на терминале вместо адреса')
+    specs={'narrow':([0.4,0.4,1.2],D('0.192')),'wide':([0.4,0.4,2],D('0.32'))}
+    require(set(p['profiles'])==set(specs),'Нужны два профиля ширины')
+    for profile,(dims,volume) in specs.items():
+        config=p['profiles'][profile]
+        require([numeric(x) for x in config['dimensions_m']]==[D(str(x)) for x in dims],'Неверные габариты '+profile)
+        require(math.prod([numeric(x) for x in config['dimensions_m']])==numeric(config['volume_m3'])==volume,'Неверный объём '+profile)
+        require(bool(config.get('as_of')) and bool(config.get('dispatch_date')),'Нет даты тарифа/сдачи '+profile)
+    quotes={(q['city'],q['profile']):q for q in p['quotes']}
+    require(len(quotes)==len(p['quotes']),'Повтор города и профиля в тарифах')
+    for (city,profile),q in quotes.items():
+        require(profile in specs,'Неизвестный профиль тарифа')
+        config=p['profiles'][profile]
+        for key in ['dimensions_m','volume_m3','as_of','dispatch_date']:
+            require(q.get(key)==config[key],'Тариф не соответствует профилю/дате: '+city+' / '+profile)
+        require(numeric(q['total'])>0 and numeric(q['auto'])>=0 and numeric(q['delivery'])>=0,'Неверный тариф '+city)
+        require(near(numeric(q['auto'])+numeric(q['delivery']),q['total'],'0.005'),'Не сходится перевозка + доставка '+city)
+        require(near(numeric(q['total'])+numeric(q['insurance'])+numeric(q['insuranceOrganization']),q['rawTotal'],'0.005'),'Неучтённые услуги в тарифе '+city)
+    city_names={city for city,_ in quotes};costs=D('0');qty=D('0');used=set();group_rows={'narrow':[],'wide':[]}
+    for x in data['items']:
+        width=numeric(x['width']);require(0<width<=200,'Ширина вне диапазона 0–200 см; нужен отдельный согласованный расчёт')
+        profile='narrow' if width<=120 else 'wide'
+        require(x.get('shipping_profile')==profile,'Неверная граница ширины, строка '+str(x['row']))
+        require(x.get('shipping_dimensions_m')==p['profiles'][profile]['dimensions_m'],'Неверные габариты строки')
+        require(near(x.get('shipping_volume_m3'),p['profiles'][profile]['volume_m3']),'Неверный объём строки')
+        if x['region'] in p['excluded_regions']:
+            require(x['shipping_unit'] is None and x['shipping_total'] is None,'Исключённый регион включён в доставку')
+            continue
+        matches=[city for city in city_names if re.search(r'\b'+re.escape(city)+r'\b',x['address'],re.I)]
+        require(len(matches)==1 and x['shipping_city']==matches[0],'Реальный населённый пункт подменён или неоднозначен')
+        key=(matches[0],profile);require(key in quotes,'Нет тарифа города и группы ширины')
+        q=quotes[key];require(x.get('shipping_as_of')==q['as_of'] and x.get('shipping_dispatch_date')==q['dispatch_date'],'Не та дата тарифа товарной строки')
+        require(near(x['shipping_unit'],q['total'],'0.005'),'Не тот тариф города/ширины')
+        expected=numeric(x['qty'])*numeric(q['total'])
+        require(near(x['shipping_total'],expected,'0.005'),'Ошибка количество × тариф')
+        costs+=expected;qty+=numeric(x['qty']);used.add(key);group_rows[profile].append(x)
+    require(near(costs,p['total_estimate'],'0.005') and qty==numeric(p['eligible_qty']),'Не сходится общий расход ПЭК')
+    actual_city_groups={(x['region'],x['shipping_city'],x['shipping_profile']) for rows in group_rows.values() for x in rows}
+    stored_city_groups={(c['region'],c['city'],c['profile']) for c in p['cities']}
+    require(len(stored_city_groups)==len(p['cities']) and actual_city_groups==stored_city_groups,'Пропущены или задвоены города/профили сводки')
+    for c in p['cities']:
+        rows=[x for x in group_rows[c['profile']] if x['region']==c['region'] and x['shipping_city']==c['city']]
+        require(numeric(c['qty'])==sum((numeric(x['qty']) for x in rows),D('0')),'Неверное количество города/профиля')
+        require(near(c['shipping_total'],sum((numeric(x['shipping_total']) for x in rows),D('0')),'0.005'),'Неверный расход города/профиля')
+    result={}
+    for profile,rows in group_rows.items():
+        n=sum((numeric(x['qty']) for x in rows),D('0'));v=sum((numeric(x['shipping_total']) for x in rows),D('0'))
+        result[profile]={'qty':float(n),'cost':float(v),'mean':float(v/n) if n else None}
+    return {'mode':'two_width_profiles','cities':len({city for city,_ in used}),'used_city_profiles':len(used),'eligible_qty':float(qty),'estimate':float(costs),'groups':result,'provider_live_rechecked':False}
+
+
 NODE_TEST = r'''
 const vm=require('node:vm'),assert=require('node:assert/strict');let input='';
 process.stdin.setEncoding('utf8');process.stdin.on('data',s=>input+=s);process.stdin.on('end',()=>{
-const {html,cases}=JSON.parse(input),payload=html.match(/<script id="payload" type="application\/json">([\s\S]*?)<\/script>/)[1],code=html.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
+const {html,cases,requireAverages}=JSON.parse(input),payload=html.match(/<script id="payload" type="application\/json">([\s\S]*?)<\/script>/)[1],code=html.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
 const ids=new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(x=>x[1])),nodes=new Map;
 class Element{constructor(id){this.value=['month','region','width'].includes(id)?'all':'';this.options=[];this.textContent=id==='payload'?payload:'';this.innerHTML='';this.classList={toggle(){}}}add(o){this.options.push(o)}addEventListener(){}setAttribute(){}get selectedOptions(){return [{textContent:this.options.find(o=>o.value===this.value)?.textContent||this.value}]}}
 const document={getElementById(id){assert(ids.has(id),'HTML lacks '+id);if(!nodes.has(id))nodes.set(id,new Element(id));return nodes.get(id)}};
 const context={document,window:{},Intl,URL,Blob,setTimeout,Option:function(t,v){this.textContent=t;this.value=v}};vm.createContext(context);vm.runInContext(code,context,{timeout:10000});
-for(const c of cases){for(const [id,v]of [['month',c.month],['region',c.region],['width',c.width]])document.getElementById(id).value=v;context.window.dashboard.render();const s=context.window.dashboard.getState();assert.deepEqual(JSON.parse(JSON.stringify(s.total)),c.total);assert.deepEqual(JSON.parse(JSON.stringify(s.denom)),c.denom);assert.equal(s.shippingQty,c.shippingQty);assert(Math.abs(s.shippingTotal-c.shippingTotal)<0.001);assert.equal(s.rows.length,c.rows)}
+for(const c of cases){for(const [id,v]of [['month',c.month],['region',c.region],['width',c.width]])document.getElementById(id).value=v;context.window.dashboard.render();const s=context.window.dashboard.getState();assert.deepEqual(JSON.parse(JSON.stringify(s.total)),c.total);assert.deepEqual(JSON.parse(JSON.stringify(s.denom)),c.denom);assert.equal(s.shippingQty,c.shippingQty);assert(Math.abs(s.shippingTotal-c.shippingTotal)<0.001);assert.equal(s.rows.length,c.rows);if(requireAverages){
+ const fmt=new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2}),qfmt=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0});
+ for(const p of ['narrow','wide'])assert.equal(document.getElementById(p+'Average').textContent,c.means[p].qty?fmt.format(c.means[p].mean)+' ₽':'—','Wrong average panel '+JSON.stringify(c));
+ const body=document.getElementById('regionBody').innerHTML,trs=[...body.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/g)].map(m=>m[1]);
+ for(const g of c.regionMeans){
+  const esc=g.region.replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+  const tr=trs.find(x=>x.includes('data-region="'+esc+'"'));assert(tr,'Missing regional row '+g.region);
+  const cells=[...tr.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)].map(m=>m[1].replace(/<[^>]*>/g,''));assert(cells.length>=7,'Missing separate average columns');
+  const tail=cells.slice(-7);for(const [p,i]of [['narrow',0],['wide',1]])assert.equal(tail[i],g[p].qty?fmt.format(g[p].mean):'—','Wrong regional average '+g.region+' '+p);
+  const hasShipping=g.narrow.qty+g.wide.qty>0;
+  assert.equal(tail[2],hasShipping?qfmt.format(g.narrow.qty):'—','Wrong narrow denominator');assert.equal(tail[3],hasShipping?qfmt.format(g.wide.qty):'—','Wrong wide denominator');
+ }
+}
+}
 console.log(JSON.stringify({cases:cases.length,engine:'Node test DOM',visual_browser_check:false}));});
 '''
 
@@ -330,7 +400,20 @@ def check_js(node,html,data):
         rows=[x for x in base if region=='all' or x['region']==region]
         shipping=[x for x in rows if x['shipping_unit'] is not None]
         cases.append({'month':month,'width':width,'region':region,'total':sums(rows),'denom':sums(base),'rows':len(rows),'shippingQty':sum(x['qty'] for x in shipping),'shippingTotal':float(sum((numeric(x['shipping_total']) for x in shipping),D('0')))})
-    result=subprocess.run([node,'-e',NODE_TEST],input=json.dumps({'html':html,'cases':cases}),text=True,encoding='utf-8',capture_output=True,timeout=60)
+    require_averages=bool(data.get('shipping',{}).get('profiles'))
+    if require_averages:
+        def means(rows):
+            result={}
+            for profile in ['narrow','wide']:
+                selected=[x for x in rows if x['shipping_unit'] is not None and (x['width']<=120 if profile=='narrow' else 120<x['width']<=200)]
+                qty=sum((numeric(x['qty']) for x in selected),D('0'));cost=sum((numeric(x['shipping_total']) for x in selected),D('0'))
+                result[profile]={'qty':float(qty),'mean':float(cost/qty) if qty else None}
+            return result
+        for c in cases:
+            rows=[x for x in data['items'] if (c['month']=='all' or x['month']==c['month']) and (c['region']=='all' or x['region']==c['region']) and (c['width']=='all' or (x['width']<=120 if c['width']=='narrow' else 120<x['width']<=200))]
+            c['means']=means(rows)
+            c['regionMeans']=[{'region':region,**means([x for x in rows if x['region']==region])} for region in sorted({x['region'] for x in rows})]
+    result=subprocess.run([node,'-e',NODE_TEST],input=json.dumps({'html':html,'cases':cases,'requireAverages':require_averages}),text=True,encoding='utf-8',capture_output=True,timeout=60)
     require(result.returncode==0,'JavaScript пересчёт не совпал с Python: '+result.stderr[-1200:])
     return json.loads(result.stdout)
 

@@ -35,8 +35,18 @@ def main():
         ('october_source_missing',None,'october',False),
         ('pickup_instead_of_door','mode',None,False),
         ('javascript_shipping_total_wrong',None,'javascript',False),
-        ('hidden_cost_sheet',None,'hidden',False),
     ]
+    if manifest.get('price'):cases.append(('hidden_cost_sheet',None,'hidden',False))
+    if data.get('shipping',{}).get('profiles'):
+        cases.extend([
+            ('wrong_width_profile','profile',None,False),
+            ('wrong_profile_volume','profile_volume',None,False),
+            ('wrong_tariff_date','date',None,False),
+            ('missing_city_profile','missing_profile',None,False),
+            ('mixed_average_denominator',None,'mixed_mean',False),
+            ('regional_mixed_denominator',None,'region_mean',False),
+            ('empty_group_as_zero',None,'empty_mean',False),
+        ])
     results=[]
     scratch_root=args.scratch_root.resolve()
     assert scratch_root.is_dir()
@@ -47,6 +57,19 @@ def main():
     try:
         for name,mutation,extra,expected_pass in cases:
             test=copy.deepcopy(data);m=copy.deepcopy(manifest);html=original
+            if mutation=='profile':next(x for x in test['items'] if x['width']==120)['shipping_profile']='wide'
+            if mutation=='profile_volume':test['shipping']['profiles']['narrow']['volume_m3']=0.19
+            if mutation=='date':next(q for q in test['shipping']['quotes'] if q['profile']=='narrow')['as_of']='2000-01-01'
+            if mutation=='missing_profile':
+                row=next(x for x in test['items'] if x['shipping_unit'] is not None and x['shipping_profile']=='narrow')
+                test['shipping']['quotes']=[q for q in test['shipping']['quotes'] if (q['city'],q['profile'])!=(row['shipping_city'],'narrow')]
+            if extra in ['mixed_mean','region_mean','empty_mean']:
+                old,new={
+                    'mixed_mean':('combined.narrowShippingTotal/combined.narrowShippingQty','combined.narrowShippingTotal/combined.shippingQty'),
+                    'region_mean':('x.narrowShippingTotal/x.narrowShippingQty','x.narrowShippingTotal/x.shippingQty'),
+                    'empty_mean':("cost(combined.wideShippingTotal/combined.wideShippingQty)+' ₽':'—'","cost(combined.wideShippingTotal/combined.wideShippingQty)+' ₽':'0,00 ₽'"),
+                }[extra]
+                assert old in html,extra;html=html.replace(old,new)
             if mutation=='qty':test['items'][0]['qty']+=1
             if mutation=='width':next(x for x in test['items'] if x['width']==120)['width']=121
             if mutation=='address':test['items'][0]['address']=test['items'][3]['address']
